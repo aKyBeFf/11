@@ -8,7 +8,7 @@ const app = express();
 app.get("/", (req, res) => res.send("PCLink bot is running"));
 app.listen(process.env.PORT || 3000, () => console.log("HTTP server started"));
 
-const BOT_TOKEN = "8653027213:AAExdE_XWrEMGtCFLLtP2k9jjefKuXp6hyo";
+const BOT_TOKEN = "8653027213:AAH7ALHxrzZtQdTrfT_EhmaGxS9EJFgxDnM";
 
 const firebaseConfig = {
   apiKey: "AIzaSyDdunIxBJEyVnVsKdmQHB1JBXZsAE7QTMs",
@@ -33,21 +33,17 @@ async function getConnectedCode(chatId) {
     return snap.exists() ? snap.data().code || null : null;
   } catch { return null; }
 }
-
 async function saveConnectedCode(chatId, code) {
-  await setDoc(doc(db, "pclink_sessions", String(chatId)), {
-    code, chatId: String(chatId), updatedAt: Date.now()
-  });
+  await setDoc(doc(db, "pclink_sessions", String(chatId)), { code, chatId: String(chatId), updatedAt: Date.now() });
 }
-
 async function removeConnectedCode(chatId) {
-  await setDoc(doc(db, "pclink_sessions", String(chatId)), {
-    code: null, chatId: String(chatId), updatedAt: Date.now()
-  });
+  await setDoc(doc(db, "pclink_sessions", String(chatId)), { code: null, chatId: String(chatId), updatedAt: Date.now() });
 }
 
-// ── WoL ───────────────────────────────────────────────────────────────
-function sendMagicPacket(mac) {
+// ── Wake-on-LAN ───────────────────────────────────────────────────────
+// Шлём на внешний IP из Firestore (агент сохраняет его при запуске)
+// Роутер должен пробрасывать UDP 9 на локальный ПК
+function sendMagicPacket(mac, targetIP) {
   return new Promise((resolve, reject) => {
     const macHex = mac.replace(/[:\-]/g, '');
     if (macHex.length !== 12) { reject(new Error('Неверный MAC')); return; }
@@ -58,7 +54,9 @@ function sendMagicPacket(mac) {
         buf[i * 6 + j] = parseInt(macHex.substring(j * 2, j * 2 + 2), 16);
     const socket = dgram.createSocket('udp4');
     socket.once('listening', () => socket.setBroadcast(true));
-    socket.send(buf, 0, buf.length, 9, '255.255.255.255', (err) => {
+    // Если есть внешний IP — шлём туда, иначе broadcast
+    const target = targetIP || '255.255.255.255';
+    socket.send(buf, 0, buf.length, 9, target, (err) => {
       socket.close();
       if (err) reject(err); else resolve();
     });
@@ -106,15 +104,21 @@ async function getPcDoc(code) {
   const snap = await getDoc(doc(db, "pclink", code));
   return snap.exists() ? snap.data() : null;
 }
-
 async function sendCommand(code, command) {
   await updateDoc(doc(db, "pclink", code), { pendingCommand: command });
 }
-
 function isOnline(data) {
   if (!data || data.status !== "online" || !data.lastSeen) return false;
   const lastSeen = data.lastSeen.toDate ? data.lastSeen.toDate() : new Date(data.lastSeen);
   return (Date.now() - lastSeen.getTime()) < 25000;
+}
+
+// ── Проверка разрешений ───────────────────────────────────────────────
+function isAllowed(data, key) {
+  const val = data['allow_' + key];
+  // Если не задано — разрешено по умолчанию (кроме lock)
+  if (val === undefined) return key !== 'lock';
+  return val === true;
 }
 
 // ── Хендлеры ─────────────────────────────────────────────────────────
@@ -137,18 +141,13 @@ bot.on("message", async (msg) => {
   if (session?.step === "waiting_code") {
     const inputCode = text.trim().toUpperCase();
     sessions[chatId] = null;
-
     const data = await getPcDoc(inputCode);
     if (!data) {
       bot.sendMessage(chatId, "Компьютер с таким кодом не найден. Проверь код и попробуй снова.", connectKeyboard());
       return;
     }
-
     await saveConnectedCode(chatId, inputCode);
-    await updateDoc(doc(db, "pclink", inputCode), {
-      connectedChatId: String(chatId), connected: true
-    });
-
+    await updateDoc(doc(db, "pclink", inputCode), { connectedChatId: String(chatId), connected: true });
     const online = isOnline(data);
     bot.sendMessage(chatId,
       `Подключено.\n\nКомпьютер: ${data.hostname || inputCode}\nСтатус: ${online ? "онлайн" : "офлайн"}`,
@@ -184,9 +183,10 @@ bot.on("message", async (msg) => {
       return;
     }
     try {
-      await sendMagicPacket(data.mac);
+      const targetIP = data.externalIP || null;
+      await sendMagicPacket(data.mac, targetIP);
       bot.sendMessage(chatId,
-        `Пакет отправлен.\n\nMAC: \`${data.mac}\`\nПК должен включиться через 10-30 секунд.\nТребуется включённый Wake-on-LAN в BIOS.`,
+        `Пакет отправлен.\n\nMAC: \`${data.mac}\`\nIP: \`${targetIP || 'broadcast'}\`\n\nПК должен включиться через 10-30 секунд.\nТребуется:\n— WoL включён в BIOS\n— UDP порт 9 проброшен на роутере`,
         { parse_mode: "Markdown", ...mainKeyboard(false) }
       );
     } catch (e) {
@@ -202,11 +202,12 @@ bot.on("message", async (msg) => {
 
   switch (text) {
     case "Статус":
+      if (!isAllowed(data, 'status')) { bot.sendMessage(chatId, "Команда отключена владельцем ПК.", mainKeyboard(true)); break; }
       bot.sendMessage(chatId,
         `*${data.hostname || code}*\n\n` +
         `CPU: ${data.cpu ?? "—"}%\n` +
         `RAM: ${data.ram ?? "—"}% (${data.ramUsed ?? "?"}/${data.ramTotal ?? "?"} GB)\n` +
-        `Платформа: ${data.platform || "—"}\n` +
+        `IP: \`${data.externalIP || "—"}\`\n` +
         `MAC: \`${data.mac || "—"}\`\n` +
         `Статус: онлайн`,
         { parse_mode: "Markdown", ...mainKeyboard(true) }
@@ -214,6 +215,7 @@ bot.on("message", async (msg) => {
       break;
 
     case "Скриншот": {
+      if (!isAllowed(data, 'screenshot')) { bot.sendMessage(chatId, "Команда отключена владельцем ПК.", mainKeyboard(true)); break; }
       bot.sendMessage(chatId, "Делаю скриншот...");
       await sendCommand(code, "screenshot");
       if (screenshotWatchers[chatId]) screenshotWatchers[chatId]();
@@ -234,16 +236,19 @@ bot.on("message", async (msg) => {
     }
 
     case "Выключить":
+      if (!isAllowed(data, 'shutdown')) { bot.sendMessage(chatId, "Команда отключена владельцем ПК.", mainKeyboard(true)); break; }
       await sendCommand(code, "shutdown");
       bot.sendMessage(chatId, "Выключение через 10 секунд. Нажми «Отмена выключения» чтобы остановить.", mainKeyboard(true));
       break;
 
     case "Перезагрузить":
+      if (!isAllowed(data, 'restart')) { bot.sendMessage(chatId, "Команда отключена владельцем ПК.", mainKeyboard(true)); break; }
       await sendCommand(code, "restart");
       bot.sendMessage(chatId, "Перезагрузка через 10 секунд.", mainKeyboard(true));
       break;
 
     case "Заблокировать":
+      if (!isAllowed(data, 'lock')) { bot.sendMessage(chatId, "Команда отключена владельцем ПК.", mainKeyboard(true)); break; }
       await sendCommand(code, "lock");
       bot.sendMessage(chatId, "Экран заблокирован.", mainKeyboard(true));
       break;
