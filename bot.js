@@ -8,7 +8,7 @@ const app = express();
 app.get("/", (req, res) => res.send("PCLink bot is running"));
 app.listen(process.env.PORT || 3000, () => console.log("HTTP server started"));
 
-const BOT_TOKEN = "8653027213:AAH7ALHxrzZtQdTrfT_EhmaGxS9EJFgxDnM";
+const BOT_TOKEN = "8653027213:AAGa3TuIs4lkOHK_gA8sTcPIVChSnh5rjb0";
 
 const firebaseConfig = {
   apiKey: "AIzaSyDdunIxBJEyVnVsKdmQHB1JBXZsAE7QTMs",
@@ -43,24 +43,49 @@ async function removeConnectedCode(chatId) {
 // ── Wake-on-LAN ───────────────────────────────────────────────────────
 // Шлём на внешний IP из Firestore (агент сохраняет его при запуске)
 // Роутер должен пробрасывать UDP 9 на локальный ПК
-function sendMagicPacket(mac, targetIP) {
-  return new Promise((resolve, reject) => {
-    const macHex = mac.replace(/[:\-]/g, '');
-    if (macHex.length !== 12) { reject(new Error('Неверный MAC')); return; }
-    const buf = Buffer.alloc(102);
-    for (let i = 0; i < 6; i++) buf[i] = 0xff;
-    for (let i = 1; i <= 16; i++)
-      for (let j = 0; j < 6; j++)
-        buf[i * 6 + j] = parseInt(macHex.substring(j * 2, j * 2 + 2), 16);
+function buildMagicBuf(mac) {
+  const macHex = mac.replace(/[:\-]/g, '');
+  if (macHex.length !== 12) throw new Error('Неверный MAC');
+  const buf = Buffer.alloc(102);
+  for (let i = 0; i < 6; i++) buf[i] = 0xff;
+  for (let i = 1; i <= 16; i++)
+    for (let j = 0; j < 6; j++)
+      buf[i * 6 + j] = parseInt(macHex.substring(j * 2, j * 2 + 2), 16);
+  return buf;
+}
+
+function sendToIP(buf, ip) {
+  return new Promise((resolve) => {
     const socket = dgram.createSocket('udp4');
     socket.once('listening', () => socket.setBroadcast(true));
-    // Если есть внешний IP — шлём туда, иначе broadcast
-    const target = targetIP || '255.255.255.255';
-    socket.send(buf, 0, buf.length, 9, target, (err) => {
+    socket.send(buf, 0, buf.length, 9, ip, () => {
       socket.close();
-      if (err) reject(err); else resolve();
+      resolve();
     });
   });
+}
+
+// Шлём на все варианты IP — провайдер может ротировать между соседними адресами
+function getIPVariants(ip) {
+  const targets = new Set(['255.255.255.255']);
+  if (!ip) return [...targets];
+  targets.add(ip);
+  const parts = ip.split('.');
+  if (parts.length === 4) {
+    const base = parts.slice(0, 3).join('.');
+    const last = parseInt(parts[3]);
+    for (let i = -3; i <= 3; i++) {
+      const n = last + i;
+      if (n >= 1 && n <= 254) targets.add(base + '.' + n);
+    }
+  }
+  return [...targets];
+}
+
+async function sendMagicPacket(mac, targetIP) {
+  const buf = buildMagicBuf(mac);
+  const ips = getIPVariants(targetIP);
+  await Promise.all(ips.map(ip => sendToIP(buf, ip)));
 }
 
 // ── Клавиатуры ────────────────────────────────────────────────────────
@@ -184,9 +209,10 @@ bot.on("message", async (msg) => {
     }
     try {
       const targetIP = data.externalIP || null;
+      const ips = getIPVariants(targetIP);
       await sendMagicPacket(data.mac, targetIP);
       bot.sendMessage(chatId,
-        `Пакет отправлен.\n\nMAC: \`${data.mac}\`\nIP: \`${targetIP || 'broadcast'}\`\n\nПК должен включиться через 10-30 секунд.\nТребуется:\n— WoL включён в BIOS\n— UDP порт 9 проброшен на роутере`,
+        `Пакет отправлен на ${ips.length} адресов.\n\nMAC: \`${data.mac}\`\nIP: \`${targetIP || 'broadcast'}\`\n\nПК должен включиться через 10-30 секунд.`,
         { parse_mode: "Markdown", ...mainKeyboard(false) }
       );
     } catch (e) {
