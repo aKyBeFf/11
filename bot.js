@@ -65,20 +65,11 @@ function sendToIP(buf, ip) {
   });
 }
 
-// Шлём на все варианты IP — провайдер может ротировать между соседними адресами
+// Исправлено: Убран спам по соседним внешним IP-адресам. 
+// Теперь пакет бьет строго в цель (externalIP) и на локальный броадкаст.
 function getIPVariants(ip) {
   const targets = new Set(['255.255.255.255']);
-  if (!ip) return [...targets];
-  targets.add(ip);
-  const parts = ip.split('.');
-  if (parts.length === 4) {
-    const base = parts.slice(0, 3).join('.');
-    const last = parseInt(parts[3]);
-    for (let i = -3; i <= 3; i++) {
-      const n = last + i;
-      if (n >= 1 && n <= 254) targets.add(base + '.' + n);
-    }
-  }
+  if (ip) targets.add(ip);
   return [...targets];
 }
 
